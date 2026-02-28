@@ -4,118 +4,34 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
-// Qwen API 基础 URL - 使用公开的代理服务
-const QWEN_BASE_URL = 'https://qwen.aikit.club';
+// 从环境变量或直接配置获取 JWT Token
+const AUTH_TOKEN = process.env.QWEN_TOKEN || `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjhkMTE4ZjI3LWFlNzItNDBhZC05YjIwLTY0MWMzZDAxMWVkMiIsImxhc3RfcGFzc3dvcmRfY2hhbmdlIjoxNzcyMzA0MjExLCJleHAiOjE3NzQ4OTY2NDB9.hCR1c8MfUWyIbNtrvON8jA80CyAExabdCCZDvkL_mRA`;
 
-// Auth Token (从 chat.qwen.ai 的 localStorage 获取，cookie 中的 token 值)
-const AUTH_TOKEN = `eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6IjhkMTE4ZjI3LWFlNzItNDBhZC05YjIwLTY0MWMzZDAxMWVkMiIsImxhc3RfcGFzc3dvcmRfY2hhbmdlIjoxNzcyMzA0MjExLCJleHAiOjE3NzQ4OTY2NDB9.hCR1c8MfUWyIbNtrvON8jA80CyAExabdCCZDvkL_mRA`;
+// 延迟加载 baxia-token 模块
+let baxiaModule = null;
 
-// 默认模型映射
-const MODEL_MAP = {
-  'gpt-4o': 'qwen2.5-max',
-  'gpt-4o-mini': 'qwen2.5-turbo',
-  'gpt-4': 'qwen2.5-max',
-  'gpt-3.5-turbo': 'qwen2.5-turbo',
-  'claude-3-opus': 'qwen2.5-max',
-  'claude-3-sonnet': 'qwen2.5-plus',
-  'claude-3-haiku': 'qwen2.5-turbo',
-};
-
-// 模型别名映射 - 直接使用代理服务支持的模型名称
-// 代理服务 (qwen.aikit.club) 支持的模型：
-// qwen3.5-plus, qwen3.5-flash, qwen3.5-397b-a17b, qwen3.5-122b-a10b,
-// qwen3.5-27b, qwen3.5-35b-a3b, qwen-max-latest, qwq-32b 等
-const MODEL_ALIAS = {
-  // Qwen3.5 系列 - 直接使用
-  'qwen3.5-plus': 'qwen3.5-plus',
-  'qwen3.5-flash': 'qwen3.5-flash',
-  'qwen3.5-397b-a17b': 'qwen3.5-397b-a17b',
-  'qwen3.5-122b-a10b': 'qwen3.5-122b-a10b',
-  'qwen3.5-27b': 'qwen3.5-27b',
-  'qwen3.5-35b-a3b': 'qwen3.5-35b-a3b',
-  
-  // Qwen Max 系列
-  'qwen-max-latest': 'qwen-max-latest',
-  'qwen-max': 'qwen-max-latest',
-  
-  // Qwen2.5 系列 (如果代理支持)
-  'qwen2.5-max': 'qwen-max-latest',
-  'qwen2.5-plus': 'qwen3.5-plus',
-  'qwen2.5-turbo': 'qwen3.5-flash',
-  'qwen-plus': 'qwen3.5-plus',
-  'qwen-turbo': 'qwen3.5-flash',
-  
-  // Qwen3 系列
-  'qwen3-max': 'qwen-max-latest',
-  
-  // 特殊模型
-  'qwq-32b': 'qwq-32b',
-  'qwen-deep-research': 'qwen-deep-research',
-  'qvq-max': 'qvq-max',
-  'qwen-web-dev': 'qwen-web-dev',
-  'qwen-full-stack': 'qwen-full-stack',
-  'qwen3-coder-plus': 'qwen3-coder-plus',
-};
-
-// 默认请求头
-function getDefaultHeaders() {
-  return {
-    'accept': 'application/json',
-    'authorization': `Bearer ${AUTH_TOKEN}`,
-    'content-type': 'application/json',
-  };
-}
-
-// 获取实际模型名称
-function getModelName(model) {
-  // 先检查别名映射
-  if (MODEL_ALIAS[model]) return MODEL_ALIAS[model];
-  // 再检查 OpenAI 模型映射
-  if (MODEL_MAP[model]) return MODEL_MAP[model];
-  // 如果没有映射，直接返回原模型名（让代理服务处理）
-  return model;
+async function getBaxiaModule() {
+  if (!baxiaModule) {
+    baxiaModule = require('./baxia-token');
+  }
+  return baxiaModule;
 }
 
 // OpenAI 格式的模型列表 API
 app.get('/v1/models', async (req, res) => {
   try {
-    const response = await fetch(`${QWEN_BASE_URL}/v1/models`, {
-      method: 'GET',
-      headers: getDefaultHeaders(),
-    });
-
-    const data = await response.json();
-    res.json(data);
+    const { getModels, closeBrowser } = await getBaxiaModule();
+    const result = await getModels(AUTH_TOKEN);
+    
+    if (result.success) {
+      res.json(result.data);
+    } else {
+      res.status(500).json({ error: { message: result.error } });
+    }
   } catch (error) {
     console.error('Error fetching models:', error);
     res.status(500).json({ 
-      error: {
-        message: 'Failed to fetch models',
-        type: 'api_error',
-        code: 'models_fetch_failed'
-      }
-    });
-  }
-});
-
-// Token 验证接口
-app.get('/v1/validate', async (req, res) => {
-  try {
-    const response = await fetch(`${QWEN_BASE_URL}/v1/validate?token=${AUTH_TOKEN}`, {
-      method: 'GET',
-      headers: getDefaultHeaders(),
-    });
-
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    console.error('Error validating token:', error);
-    res.status(500).json({ 
-      error: {
-        message: 'Failed to validate token',
-        type: 'api_error',
-        code: 'validate_failed'
-      }
+      error: { message: 'Failed to fetch models', type: 'api_error' }
     });
   }
 });
@@ -123,135 +39,95 @@ app.get('/v1/validate', async (req, res) => {
 // OpenAI 格式的聊天完成 API
 app.post('/v1/chat/completions', async (req, res) => {
   try {
-    const { model, messages, stream = false, temperature, max_tokens, tools, enable_thinking, thinking_budget } = req.body;
+    const { model, messages, stream = false } = req.body;
 
     if (!messages || !Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ 
-        error: {
-          message: 'Messages are required',
-          type: 'invalid_request_error',
-          code: 'missing_messages'
-        }
+        error: { message: 'Messages are required', type: 'invalid_request_error' }
       });
     }
 
-    const actualModel = getModelName(model);
+    const { sendChatRequest, convertToOpenAIFormat, closeBrowser } = await getBaxiaModule();
+    
+    console.log(`[API] Chat request: model=${model || 'qwen3.5-flash'}, stream=${stream}`);
+    
+    const actualModel = model || 'qwen3.5-flash';
+    const result = await sendChatRequest(AUTH_TOKEN, messages, actualModel, stream);
 
-    // 构建请求体
-    const requestBody = {
-      model: actualModel,
-      messages: messages.map(msg => {
-        // 处理消息内容
-        if (typeof msg.content === 'string') {
-          return { role: msg.role, content: msg.content };
-        } else if (Array.isArray(msg.content)) {
-          // 多模态内容（图片、文件等）
-          return { role: msg.role, content: msg.content };
-        }
-        return msg;
-      }),
-      stream: stream,
-    };
-
-    // 添加可选参数
-    if (temperature !== undefined) requestBody.temperature = temperature;
-    if (max_tokens !== undefined) requestBody.max_tokens = max_tokens;
-    if (tools !== undefined) requestBody.tools = tools;
-    if (enable_thinking !== undefined) requestBody.enable_thinking = enable_thinking;
-    if (thinking_budget !== undefined) requestBody.thinking_budget = thinking_budget;
-
-    console.log(`Sending request to Qwen API: model=${actualModel}, stream=${stream}`);
-
-    const response = await fetch(`${QWEN_BASE_URL}/v1/chat/completions`, {
-      method: 'POST',
-      headers: getDefaultHeaders(),
-      body: JSON.stringify(requestBody),
-    });
-
-    const contentType = response.headers.get('content-type') || '';
-    console.log(`Qwen API response status: ${response.status}, content-type: ${contentType}`);
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error('Qwen API error:', response.status, errorText);
-      return res.status(response.status).json({ 
-        error: {
-          message: `Qwen API error: ${response.status} - ${errorText}`,
-          type: 'api_error',
-          code: 'upstream_error'
-        }
+    if (result.error) {
+      console.error('[API] Chat error:', result.error);
+      return res.status(500).json({ 
+        error: { message: result.error, type: 'api_error' }
       });
     }
 
-    // 流式响应
-    if (stream && contentType.includes('text/event-stream')) {
+    if (stream) {
+      // 流式响应
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const chunk = decoder.decode(value, { stream: true });
-          res.write(chunk);
+      
+      // 将 Qwen 的 SSE 格式转换为 OpenAI 格式并转发
+      const responseStr = typeof result.data === 'string' 
+        ? result.data 
+        : JSON.stringify(result.data);
+      
+      const lines = responseStr.split('\n').filter(line => line.startsWith('data: '));
+      
+      for (const line of lines) {
+        const data = line.slice(6).trim();
+        if (data === '[DONE]') {
+          res.write('data: [DONE]\n\n');
+          continue;
         }
-      } finally {
-        reader.releaseLock();
-        res.end();
+        
+        try {
+          const parsed = JSON.parse(data);
+          
+          // 转换为 OpenAI 格式
+          const openAIChunk = {
+            id: `chatcmpl-${uuidv4()}`,
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: actualModel,
+            choices: [{
+              index: 0,
+              delta: {},
+              finish_reason: null,
+            }],
+          };
+          
+          if (parsed.choices && parsed.choices[0]) {
+            const choice = parsed.choices[0];
+            
+            if (choice.delta) {
+              openAIChunk.choices[0].delta = {
+                content: choice.delta.content || '',
+              };
+            }
+            
+            if (choice.finish_reason) {
+              openAIChunk.choices[0].finish_reason = choice.finish_reason;
+            }
+          }
+          
+          res.write(`data: ${JSON.stringify(openAIChunk)}\n\n`);
+        } catch (e) {
+          // 跳过解析错误
+        }
       }
+      
+      res.write('data: [DONE]\n\n');
+      res.end();
     } else {
       // 非流式响应
-      const data = await response.json();
-      res.json(data);
+      const openAI = convertToOpenAIFormat(result.data, actualModel, false);
+      res.json(openAI);
     }
   } catch (error) {
     console.error('Error in chat completions:', error);
     res.status(500).json({ 
-      error: {
-        message: error.message,
-        type: 'internal_error',
-        code: 'internal_error'
-      }
-    });
-  }
-});
-
-// 图片生成 API
-app.post('/v1/images/generations', async (req, res) => {
-  try {
-    const { prompt, size = '1024x1024' } = req.body;
-
-    if (!prompt) {
-      return res.status(400).json({ 
-        error: {
-          message: 'Prompt is required',
-          type: 'invalid_request_error',
-          code: 'missing_prompt'
-        }
-      });
-    }
-
-    const response = await fetch(`${QWEN_BASE_URL}/v1/images/generations`, {
-      method: 'POST',
-      headers: getDefaultHeaders(),
-      body: JSON.stringify({ prompt, size }),
-    });
-
-    const data = await response.json();
-    res.json(data);
-  } catch (error) {
-    console.error('Error in image generation:', error);
-    res.status(500).json({ 
-      error: {
-        message: error.message,
-        type: 'internal_error',
-        code: 'internal_error'
-      }
+      error: { message: error.message, type: 'internal_error' }
     });
   }
 });
@@ -264,21 +140,14 @@ app.get('/health', (req, res) => {
 // 根路径
 app.get('/', (req, res) => {
   res.json({
-    message: 'Qwen to OpenAI API Proxy',
-    version: '2.0.0',
-    backend: 'Using qwen.aikit.club proxy',
+    message: 'Qwen to OpenAI API Proxy (with Baxia bypass)',
+    version: '3.0.0',
+    backend: 'Using Puppeteer to bypass Baxia',
     endpoints: {
       models: '/v1/models',
       chat: '/v1/chat/completions',
-      images: '/v1/images/generations',
-      validate: '/v1/validate',
     },
-    supported_models: [
-      'qwen-max-latest', 'qwen2.5-max', 'qwen2.5-plus', 'qwen2.5-turbo',
-      'qwq-32b', 'qwen3-max', 'qwen-deep-research', 'qvq-max',
-      'qwen-web-dev', 'qwen-full-stack', 'qwen3-coder-plus'
-    ],
-    model_aliases: MODEL_MAP,
+    note: 'This version uses Puppeteer to handle Baxia security automatically',
   });
 });
 
@@ -286,7 +155,7 @@ const PORT = process.env.PORT || 8765;
 app.listen(PORT, '127.0.0.1', () => {
   console.log(`Qwen2API server running on port ${PORT}`);
   console.log(`API endpoint: http://localhost:${PORT}/v1/chat/completions`);
-  console.log(`Server started at: ${new Date().toISOString()}`);
+  console.log(`Note: First request will launch a headless browser`);
 }).on('error', (err) => {
   console.error('Server error:', err);
 });
