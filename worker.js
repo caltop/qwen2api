@@ -166,8 +166,8 @@ async function handleChatCompletions(body, authHeader, env) {
     })
   });
   const createData = await createResp.json();
-  if (!createData.success?.data?.id) {
-    return jsonResponse({ error: { message: 'Failed to create chat session' } }, 500);
+  if (!createData.success || !createData.data?.id) {
+    return jsonResponse({ error: { message: 'Failed to create chat session', details: createData } }, 500);
   }
   const chatId = createData.data.id;
 
@@ -202,7 +202,88 @@ async function handleChatCompletions(body, authHeader, env) {
     return jsonResponse({ error: { message: await chatResp.text() } }, chatResp.status);
   }
 
-  // 收集响应
+  const responseId = `chatcmpl-${uuidv4()}`;
+  const created = Math.floor(Date.now() / 1000);
+
+  // 流式响应
+  if (stream) {
+    const { readable, writable } = new TransformStream();
+    const writer = writable.getWriter();
+    const encoder = new TextEncoder();
+    
+    // 后台处理流
+    (async () => {
+      const reader = chatResp.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+          
+          for (const line of lines) {
+            if (!line.startsWith('data: ')) continue;
+            const data = line.slice(6).trim();
+            if (data === '[DONE]') {
+              await writer.write(encoder.encode('data: [DONE]\n\n'));
+              continue;
+            }
+            
+            try {
+              const parsed = JSON.parse(data);
+              if (parsed.choices?.[0]?.delta?.content) {
+                const chunk = {
+                  id: responseId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model: actualModel,
+                  choices: [{
+                    index: 0,
+                    delta: { content: parsed.choices[0].delta.content },
+                    finish_reason: parsed.choices[0].finish_reason || null
+                  }]
+                };
+                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              } else if (parsed.choices?.[0]?.finish_reason) {
+                const chunk = {
+                  id: responseId,
+                  object: 'chat.completion.chunk',
+                  created,
+                  model: actualModel,
+                  choices: [{
+                    index: 0,
+                    delta: {},
+                    finish_reason: parsed.choices[0].finish_reason
+                  }]
+                };
+                await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              }
+            } catch {}
+          }
+        }
+        
+        await writer.write(encoder.encode('data: [DONE]\n\n'));
+      } finally {
+        await writer.close();
+      }
+    })();
+    
+    return new Response(readable, {
+      headers: {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+
+  // 非流式响应 - 收集完整内容
   const reader = chatResp.body.getReader();
   const decoder = new TextDecoder();
   let buffer = '', chunks = [];
@@ -219,17 +300,6 @@ async function handleChatCompletions(body, authHeader, env) {
       const parsed = JSON.parse(data);
       if (parsed.choices?.[0]?.delta?.content) chunks.push(parsed.choices[0].delta.content);
     } catch {}
-  }
-
-  const responseId = `chatcmpl-${uuidv4()}`;
-  const created = Math.floor(Date.now() / 1000);
-
-  if (stream) {
-    const streamBody = chunks.map((c, i) => `data: ${JSON.stringify({
-      id: responseId, object: 'chat.completion.chunk', created, model: actualModel,
-      choices: [{ index: 0, delta: { content: c }, finish_reason: i === chunks.length - 1 ? 'stop' : null }]
-    })}\n\n`).join('') + 'data: [DONE]\n\n';
-    return streamResponse(streamBody);
   }
 
   return jsonResponse({
