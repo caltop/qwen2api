@@ -114,11 +114,59 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     const actualModel = model || 'qwen3.5-plus';
-    const chatId = 'd7ec7df0-cfd9-433e-8f3c-c5a6a3e6b51b';
     
     // 获取最后一条用户消息
     const lastUserMessage = messages.filter(m => m.role === 'user').pop();
     const userContent = lastUserMessage ? lastUserMessage.content : 'hello';
+    
+    // 动态获取 baxia tokens (使用浏览器获取正确格式的 token)
+    const fetchBaxia = await getFetchBaxiaModule();
+    const { bxUa, bxUmidToken, bxV } = await fetchBaxia.getBaxiaTokens();
+    
+    console.log('[API] Got baxia tokens:', { bxUaLength: bxUa.length, bxUmidToken: bxUmidToken.substring(0, 20) + '...', bxV });
+    
+    // 先创建新的 chat 会话
+    console.log('[API] Creating new chat session...');
+    const createChatBody = {
+      title: '新建对话',
+      models: [actualModel],
+      chat_mode: 'guest',
+      chat_type: 't2t',
+      timestamp: Date.now(),
+      project_id: '',
+    };
+    
+    const createHeaders = {
+      'Accept': 'application/json, text/plain, */*',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'Cookie': `token=${AUTH_TOKEN}`,
+      'Referer': 'https://chat.qwen.ai/c/guest',
+      'source': 'web',
+      'timezone': new Date().toUTCString(),
+      'x-request-id': uuidv4(),
+    };
+    
+    const createResponse = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+      method: 'POST',
+      headers: createHeaders,
+      body: JSON.stringify(createChatBody),
+    });
+    
+    const createData = await createResponse.json();
+    console.log('[API] Create chat response:', JSON.stringify(createData));
+    
+    if (!createData.success || !createData.data?.id) {
+      console.error('[API] Failed to create chat:', createData);
+      return res.status(500).json({ 
+        error: { message: 'Failed to create chat session', details: createData }
+      });
+    }
+    
+    const chatId = createData.data.id;
+    console.log('[API] Created chat with id:', chatId);
     
     const fid = uuidv4();
     const responseFid = uuidv4();
@@ -164,9 +212,9 @@ app.post('/v1/chat/completions', async (req, res) => {
     const headers = {
       'Accept': 'application/json',
       'Accept-Language': 'zh-CN,zh;q=0.9',
-      'bx-ua': '231!cI+3t4mUIyk+jov+K5gCZ48FEl2ZWfPwIPF92lBLek2KxVW/XJ2EwruCiDOX5Px4EXNhmh6EfS9eDwQGRwijIK64A4nPqeLysJcDjUACje/H3J4ZgGZpicG6K8AkiGGBTy2jws7Q+iSU6+M5Sr2nhdTZYQJc/5iDkQsOUcC2uxY+gX/wWKMx3km+0Q3oyE+jauHhUlK48RxGHkE+++3+qCS4+ItNXk6rAojCo+nHZPEq4IaVJuxxyGOEGWL+/sqh26VlXJO1W4XEfcRRg30yO+I7FzJ+t3492zZsQJ/UY1cp0BQHO3+OcbvtBQuCvcyOC6iR0vLipyoW1X4IlPU2g6wC4iw320CGOjUray0rzqtzbawtG81RVpXRk0ETmG6OCGq1P+JtaP+S49POQ93tqysOucfydh3O0VPfJHmNxSuRfJyuqwaZ7Ch9fgWw+UiPrxSk4U09W9OaR5A0P4T4PpHouWbvYitghHlwuMDW/nwH5ME2S41i4E+IpAQe+ymCFOnVWxN+OGePOfK3zxaShsGSeyAvLxG0pw9yBwHF1MSHQiFxcC0ccKTZVSg5wcxjrFrS2+qkBinCcn07yn0jrCcK2RqkDQvYKn0nGo313dqSnxXwI5yZot9yaVrUcrcC0bTe+6Z7yAYZgEjrgjLkD1700KgFGKFcjtwn5uk7x+cQpUY+mUPBdfS/XhZzgTA/X6tKT4q9+WUKRx+FY125mFk/qbXP/WIEYeasC1HDF+2pSGvU9vSW/3G6gmvdU9Fn2Vw5LEZ0mESeUbcB11BREIzCUcwJNWn60jWUxdkcFYQC7S//HjnSRlq2HdRsJqs3vHbSEtaJQydGfSIMR49l49iDKOJtSEAF+zaZ3O1hQ4hSNakpGgkVTyL/8UgNM3vYF6RvrAPoRzrKKqYPFRQU9VXT2gBMboMAepPrTCGuqPRcCd3yOlZqlXX6TYMsuAkHenjET90tJZvu3mLQ81NM0XJ961lKtZUb9x7ASsKcPl7P9QfwG9+1P+kF/uTrSwawtNf1DvPu4tKil5BJicQyxrzy0lPl5a/1huJG7MywJPa7PoiBxHIDk8xsP6ckR/F6YmVUsHkB6+F2CphUJc6wLlNVx+HYYBMYAvPUk8mvPujn+tisAoCWVF5pwVrn6MyW75g78wAE9Yshdvfqns4atiz7i9UCsfQz0WZ+4+IODLbLAHlQoweaAdWdjJ4ELwm88Hu13Wb8y1TdFrGOFD5wO3Smn4/phn4vJ2YqmQ2b4hH2HHJetE1ZVZKJ5UHOQLysnzCUFT09/ZgUea2bRrCJgxvIU/tNdbRTEjI1hUBShnycuW3HUaoExQloXD5NHNvY8+gQdqnY9fVmRwbuz1XJvahgJohNpUM0Xc5BZzoevzP9fU3p3ACwJIorGZhU+6mljvfakPLPMOtU7W1M/uh8bsNia+BJiVaZRQ3xc7NDO+i9zgNOzNIHpXwudJQ0zkFLCj89g3WwjAkUR4DfREdQevB=',
-      'bx-umidtoken': 'T2gA2jy2dTB4RcZ0JpfukTwnTuEcoMAMaB2ysHhKFCYa4TH17H9JKn5uzm2EWcR5VSQ=',
-      'bx-v': '2.5.36',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
       'Content-Type': 'application/json',
       'sec-ch-ua': '"Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145"',
       'sec-ch-ua-mobile': '?0',
@@ -175,14 +223,15 @@ app.post('/v1/chat/completions', async (req, res) => {
       'sec-fetch-mode': 'cors',
       'sec-fetch-site': 'same-origin',
       'source': 'web',
+      'version': '0.2.9',
       'timezone': new Date().toUTCString(),
       'x-accel-buffering': 'no',
       'x-request-id': uuidv4(),
-      'Cookie': `_gcl_au=1.1.2040236964.1771812821; _bl_uid=32m7bl3LyUsj2klkUwgec8L7b14p; cna=26UiIj2An1ICAWgcmKtujklv; xlly_s=1; x-ap=cn-hongkong; sca=b1e049e0; acw_tc=0a03e59417723333657876112e2a588932916e1aee5124fbb2c2f321f1572b; atpsida=5120ea96e20bebafe1e14d21_1772333439_7; tfstk=gF1EK6_FDWFeLaZcuZAzgGbdaFdpGQrba_tWrabkRHx3v_Oyrh7rA9_5rQPyjgKhAeapqUAd19GWAkdPriOzcoNbGwQpeQqbc54znFADl30nVHbijQTzjh0NowQpwVEdrr_dJ7ruYuTHZgAMjU8HZDYlqCAMohcHrXYojP8JjQYoKQcisEYEqYclqN4wyhxkZpjksP8Jj3AkZbAvqnGwup4nBgc3sWwkQnbHbbcqkFJn4wMSwbCw8pJhSh86518eLnJzlZENtG_lO6pTIARR5tSPEgejBB7lKBYfJWlwiwX1aF17PY-hv17GOdujGiRF4KfHQ4cy9BxM_Ff0PxK1_HslTd4jgLOGGKAhCREBFB8Vq6IEzbjc5Z1pB_rqj3BBkCYfJWlwiwYl4rmJSCUGw9ooUpY97naa74mFUe00jyEjeYpdBF-bJyH-epY97naa7YHJpCLwcyUd.; isg=BPT0Jsd4IYSjYbXwiZyNWpVlxbJmzRi3Rffl_I5UxX8C-ZdDst-JRpn_eTEhWVAP; ssxmod_itna=1-Yq0xyQ0QDQING0D2DRxQKhDAx7weWu4iODzxCvYG7DuxiK08D6QDBb46eHdEnTRs4tKmmBqEeKBxGNimDA5Dn_x7YDtr3IK4dBoC25ib7t0DPol/eWoxt8WRgqxpK7ACh1IEpu/TzceRxNUmGdDU4GnD06eKAdbDYAfDBYD74G_DDeDiE3Dj4GmDGANseDF0nTroPToPxDwDB=Dmu4r0eDEDG3D04uxFGwP9CxD0khwHi4HxxGW0QnqpaedDGUe4a4o0eDMFxGX/0khxDUXqshTqZSjOFoohPFDtqD9jZue6GI=T1n5O/AxAeKr4UWDbn5_Yx4ix=jGGAxzihNix30hxAx3mmNlLilhGpmueb4b4DnnYg4xYhKRxozvlf5IUH/Yr3MhGenrii0lBxAD8BhN/hK8BDBGNv7PcD49YN3YPeD; ssxmod_itna2=1-Yq0xyQ0QDQING0D2DRxQKhDAx7weWu4iODzxCvYG7DuxiK08D6QDBb46eHdEnTRs4tKmmBqEeKYxAobdYclg4tOQmDDsbYC12D=s03ojcP8Ql=l_6hEGpuDbeGSeeNsVnAhd53RhIAEDD; token=${AUTH_TOKEN}`,
+      'Cookie': `token=${AUTH_TOKEN}`,
       'Referer': 'https://chat.qwen.ai/c/guest',
     };
     
-    console.log(`[API] Chat request: model=${actualModel}, stream=${stream}`);
+    console.log(`[API] Chat request: model=${actualModel}, stream=${stream}, chatId=${chatId}`);
     
     const response = await fetch(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`, {
       method: 'POST',
@@ -218,6 +267,9 @@ app.post('/v1/chat/completions', async (req, res) => {
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
         buffer = lines.pop() || '';
+        if (buffer.includes('"code":"Bad_Request"')) {
+          console.log('Bad_Request', buffer)
+        }
         
         for (const line of lines) {
           if (!line.startsWith('data: ')) continue;
