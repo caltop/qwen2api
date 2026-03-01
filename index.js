@@ -31,6 +31,9 @@ app.get('/v1/models', async (req, res) => {
 
 // OpenAI 格式的聊天完成 API
 app.post('/v1/chat/completions', async (req, res) => {
+  const startTime = Date.now();
+  let stepTime = startTime;
+  
   try {
     const { model, messages, stream = true } = req.body;
 
@@ -46,14 +49,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     const lastUserMessage = messages.filter(m => m.role === 'user').pop();
     const userContent = lastUserMessage ? lastUserMessage.content : 'hello';
     
-    // 动态获取 baxia tokens (纯 Node.js 实现，无需浏览器)
+    // Step 1: 获取 baxia tokens
+    stepTime = Date.now();
     const baxiaNode = require('./baxia-node');
     const { bxUa, bxUmidToken, bxV } = await baxiaNode.getBaxiaTokensNode({ silent: true });
+    console.log(`[Step 1] Get baxia tokens: ${Date.now() - stepTime}ms, total: ${Date.now() - startTime}ms`);
     
-    console.log('[API] Got baxia tokens:', { bxUaLength: bxUa.length, bxUmidToken: bxUmidToken.substring(0, 20) + '...', bxV });
-    
-    // 先创建新的 chat 会话 (guest 模式，不需要登录)
-    console.log('[API] Creating new chat session (guest mode)...');
+    // Step 2: 创建新的 chat 会话
+    stepTime = Date.now();
     const createChatBody = {
       title: '新建对话',
       models: [actualModel],
@@ -82,6 +85,7 @@ app.post('/v1/chat/completions', async (req, res) => {
     });
     
     const createData = await createResponse.json();
+    console.log(`[Step 2] Create chat session: ${Date.now() - stepTime}ms, total: ${Date.now() - startTime}ms`);
     
     if (!createData.success || !createData.data?.id) {
       return res.status(500).json({ 
@@ -169,11 +173,14 @@ app.post('/v1/chat/completions', async (req, res) => {
       'Referer': 'https://chat.qwen.ai/c/guest',
     };
     
+    // Step 3: 发送聊天请求
+    stepTime = Date.now();
     const response = await fetch(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`, {
       method: 'POST',
       headers,
       body: JSON.stringify(requestBody),
     });
+    console.log(`[Step 3] Send chat request: ${Date.now() - stepTime}ms, total: ${Date.now() - startTime}ms`);
     
     if (!response.ok) {
       const errorText = await response.text();
@@ -185,6 +192,7 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     if (stream) {
       // 流式响应
+      console.log(`[Step 4] Stream response started, total: ${Date.now() - startTime}ms`);
       res.setHeader('Content-Type', 'text/event-stream');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -198,7 +206,10 @@ app.post('/v1/chat/completions', async (req, res) => {
       
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          console.log(`[Done] Total time: ${Date.now() - startTime}ms`);
+          break;
+        }
         
         buffer += decoder.decode(value, { stream: true });
         const lines = buffer.split('\n');
