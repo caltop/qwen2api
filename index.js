@@ -4,8 +4,35 @@ const { v4: uuidv4 } = require('uuid');
 const app = express();
 app.use(express.json());
 
+// API Token 配置 (从环境变量获取，多个 token 用逗号分隔)
+const API_TOKENS = (process.env.API_TOKENS || 'auto').split(',').filter(t => t.trim());
+
+// Token 验证中间件 (OpenAI 兼容格式: Authorization: Bearer <token>)
+function authMiddleware(req, res, next) {
+  // 如果没有配置 token，跳过验证
+  if (API_TOKENS.length === 0) {
+    return next();
+  }
+  
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  
+  if (!token || !API_TOKENS.includes(token)) {
+    return res.status(401).json({
+      error: {
+        message: 'Incorrect API key provided. You can find your API key at https://platform.openai.com/account/api-keys.',
+        type: 'invalid_request_error',
+        param: null,
+        code: 'invalid_api_key'
+      }
+    });
+  }
+  
+  next();
+}
+
 // OpenAI 格式的模型列表 API
-app.get('/v1/models', async (req, res) => {
+app.get('/v1/models', authMiddleware, async (req, res) => {
   try {
     const response = await fetch('https://chat.qwen.ai/api/models', {
       method: 'GET',
@@ -30,7 +57,7 @@ app.get('/v1/models', async (req, res) => {
 });
 
 // OpenAI 格式的聊天完成 API
-app.post('/v1/chat/completions', async (req, res) => {
+app.post('/v1/chat/completions', authMiddleware, async (req, res) => {
   const startTime = Date.now();
   let stepTime = startTime;
   
