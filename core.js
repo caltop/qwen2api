@@ -1006,6 +1006,9 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog) {
   const fs = require('fs');
   const os = require('os');
 
+  // 从环境变量获取最低分辨率，默认 480p
+  const minResolution = parseInt(process.env.MIN_VIDEO_RESOLUTION || '1080', 10);
+
   return new Promise((resolve, reject) => {
     const tmpDir = path.join(os.tmpdir(), 'qwen2api_videos');
     if (!fs.existsSync(tmpDir)) {
@@ -1014,10 +1017,15 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog) {
 
     const outputFile = path.join(tmpDir, `video_${Date.now()}.mp4`);
     
-    sendLog('video.download.running', { videoUrl });
+    sendLog('video.download.running', { videoUrl, minResolution: minResolution + 'p' });
+
+    // 格式选择：最低画质但分辨率不低于指定值
+    // B站等平台 worst 可能不兼容，使用 bestvideo[height<=X] 限制最高分辨率
+    // 先尝试指定分辨率范围，再降级
+    const formatSelector = `bestvideo[height=${minResolution}]+bestaudio/bestvideo[height<=${minResolution}]+bestaudio/best[height<=${minResolution}]/best`;
 
     const ytdlp = spawn('yt-dlp', [
-      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best',
+      '-f', formatSelector,
       '--no-playlist',
       '--max-filesize', '100M',
       '-o', outputFile,
@@ -1057,8 +1065,13 @@ async function downloadVideoWithYtDlp(videoUrl, sendLog) {
       try {
         const stats = fs.statSync(outputFile);
         const bytes = fs.readFileSync(outputFile);
+        const sizeMB = (stats.size / 1024 / 1024).toFixed(2);
         
-        sendLog('video.download.finished', { size: stats.size, filename: path.basename(outputFile) });
+        sendLog('video.download.finished', { 
+          filepath: outputFile, 
+          size: stats.size, 
+          sizeMB: sizeMB + ' MB'
+        });
 
         // 创建附件对象，格式与网页上传的一致
         const base64 = bytes.toString('base64');
