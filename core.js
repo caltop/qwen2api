@@ -997,6 +997,92 @@ function handleChatPage() {
 }
 
 // ============================================
+// 视频下载 (yt-dlp)
+// ============================================
+
+async function downloadVideoWithYtDlp(videoUrl, sendLog) {
+  const { spawn } = require('child_process');
+  const path = require('path');
+  const fs = require('fs');
+  const os = require('os');
+
+  return new Promise((resolve, reject) => {
+    const tmpDir = path.join(os.tmpdir(), 'qwen2api_videos');
+    if (!fs.existsSync(tmpDir)) {
+      fs.mkdirSync(tmpDir, { recursive: true });
+    }
+
+    const outputFile = path.join(tmpDir, `video_${Date.now()}.mp4`);
+    
+    sendLog('video.download.running', { videoUrl, outputFile });
+
+    const ytdlp = spawn('yt-dlp', [
+      '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/bestvideo+bestaudio/best',
+      '--no-playlist',
+      '--max-filesize', '100M',
+      '-o', outputFile,
+      '--no-warnings',
+      '--merge-output-format', 'mp4',
+      videoUrl
+    ]);
+
+    let stderr = '';
+    
+    ytdlp.stderr.on('data', (data) => {
+      stderr += data.toString();
+      // 解析下载进度
+      const progressMatch = stderr.match(/(\d+\.?\d*)%/);
+      if (progressMatch) {
+        sendLog('video.download.progress', { progress: progressMatch[1] + '%' });
+      }
+    });
+
+    ytdlp.on('close', (code) => {
+      if (code !== 0) {
+        reject(new Error(`yt-dlp exited with code ${code}: ${stderr}`));
+        return;
+      }
+
+      if (!fs.existsSync(outputFile)) {
+        reject(new Error('Video file not found after download'));
+        return;
+      }
+
+      const stats = fs.statSync(outputFile);
+      const bytes = fs.readFileSync(outputFile);
+      
+      sendLog('video.download.finished', { size: stats.size, filename: path.basename(outputFile) });
+
+      // 创建附件对象，格式与网页上传的一致
+      const base64 = bytes.toString('base64');
+      const dataUrl = `data:video/mp4;base64,${base64}`;
+      
+      const attachment = {
+        source: dataUrl,
+        filename: path.basename(outputFile),
+        mimeType: 'video/mp4',
+        explicitType: 'video'
+      };
+
+      // 清理临时文件
+      try {
+        fs.unlinkSync(outputFile);
+      } catch {}
+
+      resolve(attachment);
+    });
+
+    ytdlp.on('error', (err) => {
+      if (err.code === 'ENOENT') {
+        reject(new Error('yt-dlp not found. Please install yt-dlp first.'));
+      } else {
+        reject(err);
+      }
+    });
+  });
+}
+
+// ============================================
 // 带日志流式返回的 Chat Completions
 // ============================================
 
@@ -1130,6 +1216,21 @@ async function handleChatCompletionsWithLogs(body, authHeader, env, streamWriter
   const parsedMessages = parseIncomingMessages(messages);
   const content = parsedMessages.content;
   sendLog('message.parsed', { contentLength: content.length, attachmentCount: parsedMessages.attachments.length });
+
+  // 处理视频链接下载
+  const videoUrl = body.video_url;
+  if (videoUrl) {
+    sendLog('video.download.start', { videoUrl });
+    try {
+      const videoAttachment = await downloadVideoWithYtDlp(videoUrl, sendLog);
+      if (videoAttachment) {
+        parsedMessages.attachments.push(videoAttachment);
+        sendLog('video.download.completed', { filename: videoAttachment.filename, size: videoAttachment.bytes?.length || 0 });
+      }
+    } catch (err) {
+      sendLog('video.download.failed', { error: err.message });
+    }
+  }
 
   // 上传附件
   let uploadedFiles = [];
