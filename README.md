@@ -10,6 +10,7 @@ A proxy service that converts Qwen Chat to an OpenAI-compatible API.
 - 🚀 Streaming response support (SSE)
 - 🔐 Optional API Token authentication
 - 🌐 Multi-platform deployment support
+- 🖼️📄 Supports image and document parsing
 
 ## Deployment
 
@@ -69,6 +70,7 @@ Two public services are available for testing:
 ## Important Notes
 
 - ✅ The `/v1/chat/completions` endpoint now supports attachments and multimodal message parts, including image/file/audio inputs.
+- ✅ Supports image understanding and document parsing workflows in chat requests.
 - ⚠️ Attachments are uploaded to Qwen OSS through the same workflow used by Qwen Web, so request latency increases when sending large files.
 
 ### Attachment Compatibility (OpenAI-style)
