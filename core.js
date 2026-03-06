@@ -335,7 +335,9 @@ function extractReasoningContentFromDelta(delta) {
 function mapUpstreamDeltaToOpenAI(delta) {
   if (!delta || typeof delta !== 'object') return null;
   const mapped = {};
-  if (typeof delta.role === 'string') mapped.role = delta.role;
+  // OpenAI API 规范: 流式响应中 delta.role 只能是 "assistant" 或不设置
+  // 当上游返回 "function" 等角色时，不设置 role 字段
+  if (delta.role === 'assistant') mapped.role = delta.role;
   if (typeof delta.content === 'string') mapped.content = delta.content;
   const reasoningContent = extractReasoningContentFromDelta(delta);
   if (reasoningContent) mapped.reasoning_content = reasoningContent;
