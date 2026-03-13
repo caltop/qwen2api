@@ -97,6 +97,87 @@ function jsonResponse(body, status = 200, extraHeaders = {}) {
   });
 }
 
+function tryParseOpenAiImageSize(size) {
+  const text = normalizeInputString(size);
+  if (!text) return null;
+  const m = text.toLowerCase().match(/^(\d{2,5})\s*x\s*(\d{2,5})$/);
+  if (!m) return null;
+  const width = Number(m[1]);
+  const height = Number(m[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
+function mapOpenAiImageSizeToQwenRatio(size) {
+  const parsed = tryParseOpenAiImageSize(size);
+  if (!parsed) return '1:1';
+  const { width, height } = parsed;
+  const r = width / height;
+  const candidates = [
+    { key: '1:1', r: 1 },
+    { key: '16:9', r: 16 / 9 },
+    { key: '9:16', r: 9 / 16 },
+    { key: '4:3', r: 4 / 3 },
+    { key: '3:4', r: 3 / 4 },
+  ];
+  let best = candidates[0];
+  let bestDiff = Infinity;
+  for (const c of candidates) {
+    const diff = Math.abs(r - c.r);
+    if (diff < bestDiff) {
+      best = c;
+      bestDiff = diff;
+    }
+  }
+  return best.key;
+}
+
+function extractImageUrlsFromUpstreamSse(rawPayload) {
+  const payload = typeof rawPayload === 'string' ? rawPayload : '';
+  const urls = [];
+  for (const line of payload.split('\n')) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      const delta = parsed?.choices?.[0]?.delta;
+      if (!delta || typeof delta !== 'object') continue;
+      const phase = typeof delta.phase === 'string' ? delta.phase : '';
+      if (phase !== 'image_gen') continue;
+      const content = delta.content;
+      if (typeof content !== 'string') continue;
+      const url = content.trim();
+      if (!url) continue;
+      if (!/^https?:\/\//i.test(url)) continue;
+      urls.push(url);
+    } catch {}
+  }
+  const seen = new Set();
+  const out = [];
+  for (const u of urls) {
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
+}
+
+function bytesToBase64(bytes) {
+  let out = '';
+  let chunk = '';
+  for (let i = 0; i < bytes.length; i++) {
+    chunk += String.fromCharCode(bytes[i]);
+    if (chunk.length > 0x8000) {
+      out += btoa(chunk);
+      chunk = '';
+    }
+  }
+  if (chunk) out += btoa(chunk);
+  return out;
+}
+
 function handleChatPage() {
   const html = String.raw`<!doctype html>
 <html lang="zh-CN">
@@ -1481,6 +1562,109 @@ async function handleChatCompletions(body, authHeader, env) {
   });
 }
 
+async function handleImageGenerations(body, authHeader, env) {
+  if (!validateToken(authHeader, env)) {
+    return jsonResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
+  }
+
+  const prompt = normalizeInputString(body?.prompt);
+  if (!prompt) {
+    return jsonResponse({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400);
+  }
+
+  const actualModel = normalizeInputString(body?.model) || 'qwen3.5-plus';
+  const nRaw = body?.n;
+  let n = Number.isFinite(nRaw) ? Number(nRaw) : Number.parseInt(String(nRaw || ''), 10);
+  if (!Number.isFinite(n) || n <= 0) n = 1;
+  if (n > 10) n = 10;
+
+  const responseFormat = normalizeInputString(body?.response_format) || 'url';
+  if (responseFormat !== 'url' && responseFormat !== 'b64_json') {
+    return jsonResponse({ error: { message: 'response_format must be one of url or b64_json', type: 'invalid_request_error' } }, 400);
+  }
+
+  const qwenRatio = mapOpenAiImageSizeToQwenRatio(body?.size);
+  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
+
+  const createResp = await fetch('https://chat.qwen.ai/api/v2/chats/new', {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'Referer': 'https://chat.qwen.ai/c/guest',
+      'source': 'web',
+      'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({ title: '新建对话', models: [actualModel], chat_mode: 'guest', chat_type: 't2i', timestamp: Date.now(), project_id: '' }),
+  });
+  const createData = await createResp.json().catch(() => ({}));
+  if (!createResp.ok || !createData?.success || !createData?.data?.id) {
+    return jsonResponse({ error: { message: 'Failed to create image chat session', type: 'api_error', details: createData } }, 500);
+  }
+  const chatId = createData.data.id;
+
+  const finalPrompt = n === 1 ? prompt : `${prompt}\n\n(Generate ${n} images.)`;
+  const chatResp = await fetch(`https://chat.qwen.ai/api/v2/chat/completions?chat_id=${chatId}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json', 'Content-Type': 'application/json',
+      'bx-ua': bxUa, 'bx-umidtoken': bxUmidToken, 'bx-v': bxV,
+      'source': 'web', 'version': '0.2.9', 'Referer': 'https://chat.qwen.ai/c/guest', 'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({
+      stream: true, version: '2.1', incremental_output: true,
+      chat_id: chatId, chat_mode: 'guest', model: actualModel, parent_id: null,
+      messages: [{
+        fid: uuidv4(), parentId: null, childrenIds: [uuidv4()], role: 'user', content: finalPrompt,
+        user_action: 'chat', files: [], timestamp: Date.now(), models: [actualModel], chat_type: 't2i',
+        feature_config: { thinking_enabled: true, output_schema: 'phase', research_mode: 'normal', auto_thinking: true, thinking_format: 'summary', auto_search: false },
+        extra: { meta: { subChatType: 't2i' } }, sub_chat_type: 't2i', parent_id: null,
+      }],
+      timestamp: Date.now(),
+      size: qwenRatio,
+    }),
+  });
+
+  if (!chatResp.ok) {
+    return jsonResponse({ error: { message: await chatResp.text().catch(() => ''), type: 'api_error' } }, chatResp.status);
+  }
+
+  const reader = chatResp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+  }
+  const urls = extractImageUrlsFromUpstreamSse(buffer);
+  if (!urls || urls.length === 0) {
+    return jsonResponse({ error: { message: 'Upstream returned no image URLs', type: 'api_error' } }, 502);
+  }
+
+  const created = Math.floor(Date.now() / 1000);
+  if (responseFormat === 'url') {
+    return jsonResponse({ created, data: urls.slice(0, n).map((u) => ({ url: u })) });
+  }
+
+  try {
+    const items = [];
+    for (const u of urls.slice(0, n)) {
+      const resp = await fetch(u);
+      if (!resp.ok) throw new Error(`Failed to fetch image: HTTP ${resp.status}`);
+      const bytes = new Uint8Array(await resp.arrayBuffer());
+      items.push({ b64_json: bytesToBase64(bytes) });
+    }
+    return jsonResponse({ created, data: items });
+  } catch (err) {
+    const message = err && err.message ? err.message : 'Failed to fetch image bytes';
+    return jsonResponse({ error: { message, type: 'api_error' } }, 502);
+  }
+}
+
 async function handleChatCompletionsWithLogs(body, authHeader, env) {
   const baseResponse = await handleChatCompletions(body, authHeader, env);
   const contentType = String(baseResponse?.headers?.get('Content-Type') || '').toLowerCase();
@@ -1568,6 +1752,15 @@ export default async function handler(request, context) {
       return jsonResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
     }
     return handleChatCompletions(body, authHeader, env);
+  }
+  if (request.method === 'POST' && path === '/v1/images/generations') {
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return jsonResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
+    }
+    return handleImageGenerations(body, authHeader, env);
   }
   if (request.method === 'GET' && (path === '/chat' || path === '/chat/')) {
     return handleChatPage();

@@ -4,7 +4,44 @@
  * 支持: Docker (Express) / Vercel / Netlify
  */
 
-const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI } = require('./core.js');
+const { handleModels, handleChatCompletions, handleChatCompletionsWithLogs, handleImageGenerations, handleRoot, handleChatPage, createResponse, validateToken, uuidv4, mapUpstreamDeltaToOpenAI } = require('./core.js');
+
+function tryParseJson(text) {
+  if (typeof text !== 'string') return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function tryParseLooseJson(text) {
+  // Best-effort recovery for PowerShell/curl quoting issues where JSON quotes are stripped,
+  // e.g. {prompt:test} or {model:qwen3.5-plus,n:2}.
+  // This keeps strict JSON behavior for normal clients, while making local debugging less painful.
+  if (typeof text !== 'string') return null;
+  let s = text.trim();
+  if (!s) return null;
+  if (!((s.startsWith('{') && s.endsWith('}')) || (s.startsWith('[') && s.endsWith(']')))) return null;
+
+  // Quote unquoted object keys: {a:1, b:2} -> {"a":1, "b":2}
+  s = s.replace(/([,{]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+
+  // Quote bare values after ':' when they are not valid JSON primitives.
+  s = s.replace(/(:\s*)([^\s"\[{][^,}\]]*)/g, (match, prefix, rawValue) => {
+    const value = String(rawValue || '').trim();
+    if (!value) return match;
+    if (value.startsWith('"') || value.startsWith('{') || value.startsWith('[')) return match;
+    const lowered = value.toLowerCase();
+    if (lowered === 'true' || lowered === 'false' || lowered === 'null') return `${prefix}${lowered}`;
+    if (/^-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?$/.test(value)) return `${prefix}${value}`;
+    return `${prefix}${JSON.stringify(value)}`;
+  });
+
+  return tryParseJson(s);
+}
 
 function logRequestPathBegin(runtime, path) {
   console.log(`[qwen2api][${runtime}][request.begin] path=${path}`);
@@ -281,7 +318,11 @@ async function serverlessHandler(req, res) {
     logRequestPathBegin('serverless', normalizedPathname);
     let body;
     try {
-      body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+      if (typeof req.body === 'string') {
+        body = tryParseJson(req.body) || tryParseLooseJson(req.body) || {};
+      } else {
+        body = req.body || {};
+      }
     } catch {
       const bad = createResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
       if (res) return res.status(bad.statusCode).set(bad.headers).send(bad.body);
@@ -302,7 +343,11 @@ async function serverlessHandler(req, res) {
     logRequestPathBegin('serverless', normalizedPathname);
     let body;
     try {
-      body = typeof req.body === 'string' ? JSON.parse(req.body) : (req.body || {});
+      if (typeof req.body === 'string') {
+        body = tryParseJson(req.body) || tryParseLooseJson(req.body) || {};
+      } else {
+        body = req.body || {};
+      }
     } catch {
       const bad = createResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
       if (res) return res.status(bad.statusCode).set(bad.headers).send(bad.body);
@@ -316,6 +361,25 @@ async function serverlessHandler(req, res) {
       }
       return res.status(result.statusCode).set(result.headers).send(result.body);
     }
+    return result;
+  }
+
+  if (req.method === 'POST' && normalizedPathname === '/v1/images/generations') {
+    logRequestPathBegin('serverless', normalizedPathname);
+    let body;
+    try {
+      if (typeof req.body === 'string') {
+        body = tryParseJson(req.body) || tryParseLooseJson(req.body) || {};
+      } else {
+        body = req.body || {};
+      }
+    } catch {
+      const bad = createResponse({ error: { message: 'Invalid JSON body.', type: 'invalid_request_error' } }, 400);
+      if (res) return res.status(bad.statusCode).set(bad.headers).send(bad.body);
+      return bad;
+    }
+    const result = await handleImageGenerations(body, authHeader);
+    if (res) return res.status(result.statusCode).set(result.headers).send(result.body);
     return result;
   }
 
@@ -355,7 +419,18 @@ function startExpressServer() {
     next();
   });
 
-  app.use(express.json({ limit: jsonLimit }));
+  app.use(express.json({
+    limit: jsonLimit,
+    verify: (req, res, buf) => {
+      try {
+        req.rawBody = buf ? buf.toString('utf8') : '';
+      } catch {
+        req.rawBody = '';
+      }
+    }
+  }));
+
+  // req.rawBody is captured via express.json verify.
 
   app.use((error, req, res, next) => {
     if (!error) return next();
@@ -368,6 +443,13 @@ function startExpressServer() {
       });
     }
     if (error.type === 'entity.parse.failed' || error.status === 400) {
+      const raw = typeof req.rawBody === 'string' ? req.rawBody : '';
+      const salvaged = tryParseLooseJson(raw);
+      if (salvaged && typeof salvaged === 'object') {
+        // Replace body and continue to route handler.
+        req.body = salvaged;
+        return next();
+      }
       return res.status(400).json({
         error: {
           message: 'Invalid JSON body.',
@@ -420,6 +502,12 @@ function startExpressServer() {
     if (result && typeof result.statusCode === 'number') {
       res.status(result.statusCode).set(result.headers).send(result.body);
     }
+  });
+
+  app.post('/v1/images/generations', authMiddleware, async (req, res) => {
+    logRequestPathBegin('express', req.path || '/v1/images/generations');
+    const result = await handleImageGenerations(req.body, req.headers.authorization);
+    res.status(result.statusCode).set(result.headers).send(result.body);
   });
 
   app.get('/', (req, res) => {

@@ -406,6 +406,93 @@ function mapUsageToOpenAI(usage) {
   return mapped;
 }
 
+function tryParseOpenAiImageSize(size) {
+  const text = normalizeInputString(size);
+  if (!text) return null;
+  const m = text.toLowerCase().match(/^(\d{2,5})\s*x\s*(\d{2,5})$/);
+  if (!m) return null;
+  const width = Number(m[1]);
+  const height = Number(m[2]);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  return { width, height };
+}
+
+function mapOpenAiImageSizeToQwenRatio(size) {
+  // Qwen Web t2i 在抓包中使用 ratio 文本，例如 "16:9"。
+  // 这里把 OpenAI 的 "1024x1024" 映射到常见比例，无法匹配时默认 1:1。
+  const parsed = tryParseOpenAiImageSize(size);
+  if (!parsed) return '1:1';
+  const { width, height } = parsed;
+  const r = width / height;
+
+  // 常见目标比例
+  const candidates = [
+    { key: '1:1', r: 1 },
+    { key: '16:9', r: 16 / 9 },
+    { key: '9:16', r: 9 / 16 },
+    { key: '4:3', r: 4 / 3 },
+    { key: '3:4', r: 3 / 4 },
+  ];
+
+  let best = candidates[0];
+  let bestDiff = Infinity;
+  for (const c of candidates) {
+    const diff = Math.abs(r - c.r);
+    if (diff < bestDiff) {
+      best = c;
+      bestDiff = diff;
+    }
+  }
+  return best.key;
+}
+
+function extractImageUrlsFromUpstreamSse(rawPayload) {
+  const payload = typeof rawPayload === 'string' ? rawPayload : '';
+  const urls = [];
+
+  for (const line of payload.split('\n')) {
+    const trimmed = line.trimStart();
+    if (!trimmed.startsWith('data:')) continue;
+    const data = trimmed.slice(5).trim();
+    if (!data || data === '[DONE]') continue;
+    try {
+      const parsed = JSON.parse(data);
+      const delta = parsed?.choices?.[0]?.delta;
+      if (!delta || typeof delta !== 'object') continue;
+      const phase = typeof delta.phase === 'string' ? delta.phase : '';
+      if (phase !== 'image_gen') continue;
+      const content = delta.content;
+      if (typeof content !== 'string') continue;
+      const url = content.trim();
+      if (!url) continue;
+      if (!/^https?:\/\//i.test(url)) continue;
+      urls.push(url);
+    } catch {
+      // ignore
+    }
+  }
+
+  // 去重但保持顺序
+  const seen = new Set();
+  const out = [];
+  for (const u of urls) {
+    if (seen.has(u)) continue;
+    seen.add(u);
+    out.push(u);
+  }
+  return out;
+}
+
+async function fetchImageAsBase64(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    throw new Error(`Failed to fetch image: HTTP ${resp.status}`);
+  }
+  const arrayBuffer = await resp.arrayBuffer();
+  const bytes = Buffer.from(arrayBuffer);
+  return bytes.toString('base64');
+}
+
 function decodeUtf8(bytes) {
   try {
     return new TextDecoder('utf-8', { fatal: false }).decode(bytes || new Uint8Array());
@@ -954,6 +1041,167 @@ async function handleModels(authHeader, env) {
     return createResponse(await resp.json());
   } catch {
     return createResponse({ error: { message: 'Failed to fetch models', type: 'api_error' } }, 500);
+  }
+}
+
+async function handleImageGenerations(body, authHeader, env) {
+  // OpenAI Images API compatible: POST /v1/images/generations
+  // Request fields: prompt (required), model (optional), n (optional), size (optional), response_format (optional)
+  if (!validateToken(authHeader, env)) {
+    return createResponse({ error: { message: 'Incorrect API key provided.', type: 'invalid_request_error' } }, 401);
+  }
+
+  const prompt = normalizeInputString(body?.prompt);
+  if (!prompt) {
+    return createResponse({ error: { message: 'prompt is required', type: 'invalid_request_error' } }, 400);
+  }
+
+  const actualModel = normalizeInputString(body?.model) || 'qwen3.5-plus';
+  const nRaw = body?.n;
+  let n = Number.isFinite(nRaw) ? Number(nRaw) : Number.parseInt(String(nRaw || ''), 10);
+  if (!Number.isFinite(n) || n <= 0) n = 1;
+  if (n > 10) n = 10;
+
+  const responseFormat = normalizeInputString(body?.response_format) || 'url';
+  if (responseFormat !== 'url' && responseFormat !== 'b64_json') {
+    return createResponse({ error: { message: 'response_format must be one of url or b64_json', type: 'invalid_request_error' } }, 400);
+  }
+
+  const qwenRatio = mapOpenAiImageSizeToQwenRatio(body?.size);
+  const { bxUa, bxUmidToken, bxV } = await getBaxiaTokens();
+
+  // 创建 t2i 会话
+  const createResp = await fetch(`${QWEN_BASE_URL}/api/v2/chats/new`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'Referer': QWEN_GUEST_REFERER,
+      'source': 'web',
+      'User-Agent': WEB_USER_AGENT,
+      'Accept-Language': WEB_ACCEPT_LANGUAGE,
+      'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({
+      title: '新建对话',
+      models: [actualModel],
+      chat_mode: 'guest',
+      chat_type: 't2i',
+      timestamp: Date.now(),
+      project_id: '',
+    }),
+  });
+  const createParsed = await safeReadJson(createResp);
+  if (!createParsed.ok) {
+    return createResponse({
+      error: {
+        message: `Failed to create image chat session: upstream returned non-JSON response (HTTP ${createResp.status}).`,
+        type: 'api_error',
+      },
+    }, createResp.ok ? 502 : createResp.status);
+  }
+  const createData = createParsed.data;
+  if (!createData?.success || !createData?.data?.id) {
+    return createResponse({ error: { message: 'Failed to create image chat session', type: 'api_error' } }, 500);
+  }
+  const chatId = createData.data.id;
+
+  // 尽力把 n 映射给上游：上游未发现显式参数，只能通过 prompt 提示。
+  const finalPrompt = n === 1 ? prompt : `${prompt}\n\n(Generate ${n} images.)`;
+
+  const chatResp = await fetch(`${QWEN_BASE_URL}/api/v2/chat/completions?chat_id=${chatId}`, {
+    method: 'POST',
+    headers: {
+      'Accept': 'application/json',
+      'Content-Type': 'application/json',
+      'bx-ua': bxUa,
+      'bx-umidtoken': bxUmidToken,
+      'bx-v': bxV,
+      'source': 'web',
+      'version': '0.2.9',
+      'Referer': QWEN_GUEST_REFERER,
+      'User-Agent': WEB_USER_AGENT,
+      'Accept-Language': WEB_ACCEPT_LANGUAGE,
+      'x-request-id': uuidv4(),
+    },
+    body: JSON.stringify({
+      stream: true,
+      version: '2.1',
+      incremental_output: true,
+      chat_id: chatId,
+      chat_mode: 'guest',
+      model: actualModel,
+      parent_id: null,
+      messages: [{
+        fid: uuidv4(),
+        parentId: null,
+        childrenIds: [uuidv4()],
+        role: 'user',
+        content: finalPrompt,
+        user_action: 'chat',
+        files: [],
+        timestamp: Date.now(),
+        models: [actualModel],
+        chat_type: 't2i',
+        feature_config: {
+          thinking_enabled: true,
+          output_schema: 'phase',
+          research_mode: 'normal',
+          auto_thinking: true,
+          thinking_format: 'summary',
+          auto_search: false,
+        },
+        extra: { meta: { subChatType: 't2i' } },
+        sub_chat_type: 't2i',
+        parent_id: null,
+      }],
+      timestamp: Date.now(),
+      size: qwenRatio,
+    }),
+  });
+
+  if (!chatResp.ok) {
+    const errorText = await chatResp.text().catch(() => '');
+    return createResponse({ error: { message: errorText || `HTTP ${chatResp.status}`, type: 'api_error' } }, chatResp.status);
+  }
+
+  const reader = chatResp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+  }
+  const urls = extractImageUrlsFromUpstreamSse(buffer);
+  if (!urls || urls.length === 0) {
+    return createResponse({ error: { message: 'Upstream returned no image URLs', type: 'api_error' } }, 502);
+  }
+
+  const created = Math.floor(Date.now() / 1000);
+  if (responseFormat === 'url') {
+    return createResponse({
+      created,
+      data: urls.slice(0, n).map((u) => ({ url: u })),
+    });
+  }
+
+  // b64_json
+  try {
+    const b64List = [];
+    for (const u of urls.slice(0, n)) {
+      b64List.push(await fetchImageAsBase64(u));
+    }
+    return createResponse({
+      created,
+      data: b64List.map((b64) => ({ b64_json: b64 })),
+    });
+  } catch (err) {
+    const message = err && err.message ? err.message : 'Failed to fetch image bytes';
+    return createResponse({ error: { message, type: 'api_error' } }, 502);
   }
 }
 
@@ -1837,6 +2085,7 @@ module.exports = {
   handleModels,
   handleChatCompletions,
   handleChatCompletionsWithLogs,
+  handleImageGenerations,
   handleRoot,
   handleChatPage,
   createResponse,
