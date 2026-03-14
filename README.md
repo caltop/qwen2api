@@ -78,7 +78,7 @@ Two public services are available for testing:
 | Service URL | Platform |
 |-------------|----------|
 | `https://qwen2api-n.smanx.xx.kg` | Netlify |
-| `https://qwen2api-v.smanx.xx.kg` | Vercel |
+| ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ (Usage limit exceeded, service stopped) |
 
 - No API Token required (leave key empty)
 - Self-deployment is recommended for more stable service

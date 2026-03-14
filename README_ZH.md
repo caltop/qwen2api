@@ -62,7 +62,7 @@ wrangler deploy
 | 服务地址 | 平台 |
 |----------|------|
 | `https://qwen2api-n.smanx.xx.kg` | Netlify |
-| `https://qwen2api-v.smanx.xx.kg` | Vercel |
+| ~~`https://qwen2api-v.smanx.xx.kg`~~ | ~~Vercel~~ （使用超额已停机） |
 
 - 无需 API Token（密钥为空）
 - 建议自行部署以获得更稳定的服务
