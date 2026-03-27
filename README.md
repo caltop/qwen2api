@@ -90,6 +90,7 @@ Two public services are available for testing:
 - ✅ The `/v1/chat/completions` endpoint now supports attachments and multimodal message parts, including image/file/audio inputs.
 - ✅ Supports image understanding and document parsing workflows in chat requests.
 - ⚠️ Attachments are uploaded to Qwen OSS through the same workflow used by Qwen Web, so request latency increases when sending large files.
+- ❌ **Tool calling is not supported** - The project does not implement OpenAI-style tool/function calling capabilities.
 
 ### Limitations (Video URL / Large Files)
 
